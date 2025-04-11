@@ -1,0 +1,1013 @@
+from fastapi import FastAPI, Query, HTTPException, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Dict, List, Union
+import requests
+import json
+import os
+from dotenv import load_dotenv
+import logging
+from sqlalchemy.orm import Session
+from . import models, utils
+from .database import engine, get_db
+from pydantic import BaseModel, EmailStr
+from .auth.dependencies import get_current_user
+from .models import users, properties, user_inputs, user_saved_properties
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+models.Base.metadata.create_all(bind=engine)
+users.Base.metadata.create_all(bind=engine)
+properties.Base.metadata.create_all(bind=engine)
+user_inputs.Base.metadata.create_all(bind=engine)
+user_saved_properties.Base.metadata.create_all(bind=engine)
+
+app = FastAPI()
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    name: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+@app.get("/")
+async def root():
+    return {"message": "Real Estate Analysis API"}
+
+@app.get("/api/properties/search")
+async def search_property(
+    postal_code: str = None,
+    city: str = None,
+    state_code: str = None
+) -> Dict:
+    try:
+        # Check for API key in environment variables
+        api_key = os.getenv('REALTY_API_KEY')
+        if not api_key:
+            logger.error("REALTY_API_KEY not found in environment variables")
+            raise HTTPException(status_code=500, detail="API key not configured")
+
+        url = "https://realty-in-us.p.rapidapi.com/properties/v3/list"
+        
+        # Prepare request payload
+        payload = {
+            "limit": 10,
+            "offset": 0,
+            "status": ["for_sale", "ready_to_build"],
+            "sort": {
+                "direction": "desc",
+                "field": "list_date"
+            }
+        }
+
+        # Add search parameters based on what's provided
+        if postal_code:
+            payload["postal_code"] = postal_code
+        elif city and state_code:
+            payload["city"] = city
+            payload["state_code"] = state_code
+        else:
+            raise HTTPException(status_code=400, detail="Either postal_code or both city and state_code must be provided")
+        
+        # Set up headers for RapidAPI
+        headers = {
+            'X-RapidAPI-Key': api_key,
+            'X-RapidAPI-Host': "realty-in-us.p.rapidapi.com",
+            'Content-Type': "application/json"
+        }
+
+        logger.info(f"Making request to RapidAPI with postal code: {postal_code}, city: {city}, state_code: {state_code}")
+        
+        # Make API request
+        response = requests.post(url, json=payload, headers=headers)
+        
+        # Check for successful response
+        if response.status_code != 200:
+            logger.error(f"RapidAPI error: {response.text}")
+            raise HTTPException(
+                status_code=response.status_code, 
+                detail=f"Error from external API: {response.text}"
+            )
+
+        data = response.json()
+
+        # Process API response data
+        if 'data' in data and 'home_search' in data['data']:
+            properties = data['data']['home_search'].get('results', [])
+            
+            if not properties:
+                return {"properties": []}
+
+            # Extract and format relevant property information
+            formatted_properties = []
+            for prop in properties:
+                try:
+                    location = prop.get('location', {})
+                    address = location.get('address', {})
+                    description = prop.get('description', {})
+                    
+                    # Create formatted property object with coordinates
+                    formatted_prop = {
+                        "property_id": prop.get('property_id', ''),
+                        "address": f"{address.get('line', '')} {address.get('city', '')}, {address.get('state', '')}",
+                        "price": f"${prop.get('list_price', 0):,}",
+                        "bedrooms": description.get('beds', 0),
+                        "bathrooms": description.get('baths', 0),
+                        "square_feet": description.get('sqft', 0),
+                        "property_type": description.get('type', 'N/A'),
+                        "last_sold_date": prop.get('last_sold_date', 'N/A'),
+                        "location": {
+                            "address": {
+                                "coordinate": address.get('coordinate', {})  # 원본 좌표 데이터를 그대로 유지
+                            }
+                        }
+                    }
+                    
+                    # Debug log
+                    logger.info(f"Formatted property coordinates: {formatted_prop['location']['address']['coordinate']}")
+                    
+                    formatted_properties.append(formatted_prop)
+                except Exception as e:
+                    logger.error(f"Error formatting property: {e}")
+                    continue
+            
+            return {"properties": formatted_properties}
+        else:
+            logger.warning("No properties found in response")
+            return {"properties": []}
+
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/locations/v2/auto-complete")
+async def autocomplete_location(
+    input: str = Query(..., description="Search input (address, city, or ZIP code)"),
+    limit: int = Query(10, description="Number of suggestions to return")
+):
+    try:
+        api_key = os.getenv('REALTY_API_KEY')
+        if not api_key:
+            logger.error("REALTY_API_KEY not found in environment variables")
+            raise HTTPException(status_code=500, detail="API key not configured")
+
+        url = "https://realty-in-us.p.rapidapi.com/locations/v2/auto-complete"
+        
+        headers = {
+            'X-RapidAPI-Key': api_key,
+            'X-RapidAPI-Host': "realty-in-us.p.rapidapi.com"
+        }
+
+        params = {
+            'input': input,
+            'limit': limit
+        }
+
+        logger.info(f"Making autocomplete request to RapidAPI with input: {input}")
+        
+        response = requests.get(url, headers=headers, params=params)
+        
+        if response.status_code != 200:
+            logger.error(f"RapidAPI error: {response.text}")
+            raise HTTPException(
+                status_code=response.status_code, 
+                detail=f"Error from external API: {response.text}"
+            )
+
+        data = response.json()
+        
+        # Format the response to match the expected structure
+        formatted_suggestions = []
+        if 'autocomplete' in data:
+            for item in data['autocomplete']:
+                suggestion = {
+                    'city': item.get('city'),
+                    'state_code': item.get('state_code'),
+                    'postal_code': item.get('postal_code'),
+                    'area_type': item.get('area_type'),
+                    'country': item.get('country')
+                }
+                # Only add line field if it exists
+                if 'line' in item:
+                    suggestion['line'] = item['line']
+                formatted_suggestions.append(suggestion)
+
+        return {
+            "meta": data.get('meta', {}),
+            "autocomplete": formatted_suggestions
+        }
+
+    except Exception as e:
+        logger.error(f"Unexpected error in autocomplete: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/properties/v3/detail")
+async def get_property_detail(property_id: str) -> Dict:
+    try:
+        logger.info(f"Getting property detail for ID: {property_id}")
+        
+        if not property_id:
+            logger.error("No property_id provided")
+            raise HTTPException(
+                status_code=422,
+                detail="Property ID is required"
+            )
+
+        api_key = os.getenv('REALTY_API_KEY')
+        if not api_key:
+            logger.error("REALTY_API_KEY not found in environment variables")
+            raise HTTPException(status_code=500, detail="API key not configured")
+
+        url = "https://realty-in-us.p.rapidapi.com/properties/v3/detail"
+        
+        headers = {
+            'X-RapidAPI-Key': api_key,
+            'X-RapidAPI-Host': "realty-in-us.p.rapidapi.com"
+        }
+
+        params = {
+            'property_id': property_id
+        }
+
+        logger.info(f"Making request to RapidAPI with params: {params}")
+        response = requests.get(url, headers=headers, params=params)
+        
+        if response.status_code != 200:
+            logger.error(f"RapidAPI error: {response.text}")
+            raise HTTPException(
+                status_code=response.status_code, 
+                detail=f"Error from external API: {response.text}"
+            )
+
+        logger.info("Successfully retrieved property details")
+        return response.json()
+
+    except Exception as e:
+        logger.error(f"Unexpected error in property detail: {str(e)}")
+        logger.exception("Full traceback:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/signup", status_code=status.HTTP_201_CREATED)
+async def signup(user_data: UserCreate, db: Session = Depends(get_db)):
+    # Check if user already exists
+    db_user = db.query(models.User).filter(models.User.email == user_data.email).first()
+    if db_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Create new user
+    hashed_password = utils.get_password_hash(user_data.password)
+    db_user = models.User(
+        email=user_data.email,
+        password=hashed_password,
+        username=user_data.name
+    )
+    
+    try:
+        db.add(db_user)
+        db.commit()
+        db.refresh(db_user)
+        return {"message": "User created successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not create user"
+        )
+
+@app.post("/api/login")
+async def login(user_data: UserLogin, db: Session = Depends(get_db)):
+    # Check user
+    user = db.query(models.User).filter(models.User.email == user_data.email).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password"
+        )
+    
+    # Verify password
+    if not utils.verify_password(user_data.password, user.password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password"
+        )
+    
+    # Generate JWT token
+    access_token = utils.create_access_token(
+        data={"sub": user.email}
+    )
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+def get_user_inputs() -> Dict:
+    return {
+        # Property Info
+        "vacancyRate": 5,
+        "managementRate": 10,
+        "advertisingCostPerVacancy": 100,
+        
+        # Purchase Info
+        "repairs": 5000,
+        "repairsContingency": 0,
+        "lenderFee": 10000,
+        "brokerFee": 500,
+        "environmentals": 0,
+        "inspections": 1300,
+        "appraisals": 1000,
+        "misc": 500,
+        "legal": 4000,
+        
+        # Financing
+        "mtgAmortizationPeriod": 30,
+        "firstMtgInterestRate": 6.5,
+        "firstMtgAmortizationPeriod": 30,
+        "firstMtgCMHCFee": 0,
+        "secondMtgPrinciple": 0,
+        "secondMtgInterestRate": 12,
+        "secondMtgAmortization": 9999,
+        "interestOnlyPrinciple": 0,
+        "interestOnlyRate": 0,
+        "otherMonthlyFinancing": 0,
+        
+        # Income
+        "parking": 0,
+        "storage": 0,
+        "laundry": 0,
+        "otherIncome": 0,
+        "grossRents": 0,
+        "parkingIncome": 0,
+        "storageIncome": 0,
+        "laundryVendingIncome": 0,
+        
+        # Operating Expenses
+        "repairsRate": 5,
+        "electricity": 1000,
+        "gas": 0,
+        "lawnMaintenance": 0,
+        "waterSewer": 100,
+        "cable": 0,
+        "caretaking": 0,
+        "trashRemoval": 0,
+        "miscExpenses": 0,
+        "commonAreaMaintenance": 0,
+        "capitalImprovements": 0,
+        "accounting": 0,
+        "legalExpenses": 0,
+        "badDebts": 0,
+        "otherExpenses": 0,
+        "insurance": 0,
+        "utilities": 0,
+        "maintenance": 0,
+        "annualAppreciationRate": 0,
+        "lawnSnowMaintenance": 0,
+        "pestControl": 0,
+        "security": 0,
+        "evictions": 0,
+        
+        # Cash Requirements
+        "depositsWithOffer": 0,
+        "proRationOfRents": 0
+    }
+
+@app.get("/api/properties/search-cashflow-by-property-id")
+async def search_property_cashflow_by_id(property_id: str) -> Dict:
+    try:
+        logger.info(f"Received request for property_id: {property_id}")
+        
+        # user inputs 가져오기
+        user_inputs = get_user_inputs()
+        logger.info("Retrieved user inputs")
+
+        detail_response = await get_property_detail(property_id)
+        logger.info("Retrieved property details")
+        
+        if not detail_response:
+            logger.warning("No property details found")
+            return {"properties": []}
+            
+        calculated_data = calculate_cashflow(detail_response, user_inputs)
+        logger.info("Calculated cashflow data")
+        
+        property_data = {
+            "property_id": property_id,
+            "cashflow_per_unit": calculated_data.get('Cashflow per Unit per Month'),
+            "calculated_data": calculated_data,
+            "api_data": detail_response,
+            "user_inputs": user_inputs
+        }
+        
+        logger.info("Sending response")
+        return {"properties": [property_data]}
+
+    except Exception as e:
+        logger.error(f"Error in search_property_cashflow_by_id: {str(e)}")
+        logger.exception("Full traceback:")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/properties/search-cashflow")
+async def search_property_cashflow(
+    postal_code: str = None,
+    city: str = None,
+    state_code: str = None
+) -> Dict:
+    try:
+        # user inputs 가져오기
+        user_inputs = get_user_inputs()
+
+        # search_property 함수를 사용하여 properties/v3/list API 호출
+        properties_response = await search_property(postal_code, city, state_code)
+        
+        if not properties_response.get("properties"):
+            return {"properties": []}
+
+        properties = []
+        
+        # 각 property에 대해 상세 정보 조회 및 cashflow 계산
+        for property_item in properties_response["properties"]:
+            # property detail API 호출
+            detail_response = await get_property_detail(property_item["property_id"])
+            
+            # cashflow 계산
+            calculated_data = calculate_cashflow(detail_response, user_inputs)
+            
+            # 응답 데이터 구성
+            property_data = {
+                **property_item,  # 기존 property 정보 유지
+                "cashflow_per_unit": calculated_data['Cashflow per Unit per Month'],
+                "calculated_data": calculated_data,
+                "api_data": detail_response,
+                "user_inputs": user_inputs
+            }
+            
+            properties.append(property_data)
+
+        return {"properties": properties}
+
+    except Exception as e:
+        logger.error(f"Unexpected error in search_property_cashflow: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+def calculate_total_income(property_detail: Dict, user_inputs: Dict) -> float:
+    try:
+        # Get rent from property detail or use estimated value
+        list_price = (
+            property_detail.get('data', {})
+            .get('home', {})
+            .get('list_price', 0)
+        )
+        # grossRents temporary fix
+        estimated_monthly_rent = 3000
+        gross_rents = user_inputs.get('grossRents', estimated_monthly_rent)
+    
+        # Additional income sources
+        parking = user_inputs.get('parkingIncome', 0)
+        storage = user_inputs.get('storageIncome', 0)
+        laundry = user_inputs.get('laundryVendingIncome', 0)
+        other = user_inputs.get('otherIncome', 0)
+        
+        total = gross_rents + parking + storage + laundry + other
+        return total * 12  # 연간 수입으로 변환
+    except Exception as e:
+        logger.error(f"Error in calculate_total_income: {e}")
+        return 0
+
+def calculate_vacancy_loss(total_income: float, user_inputs: Dict) -> float:
+    vacancy_rate = user_inputs.get('vacancyRate', 5)
+    return (vacancy_rate / 100) * total_income
+
+def calculate_effective_gross_income(total_income: float, vacancy_loss: float) -> float:
+    return total_income - vacancy_loss
+
+def calculate_management_cost(total_income: float, user_inputs: Dict) -> float:
+    management_rate = user_inputs.get('managementRate', 8)
+    return (management_rate / 100) * total_income
+
+def calculate_advertizing_cost(property_detail: Dict, user_inputs: Dict) -> float:
+    try:
+        units = (
+            property_detail.get('data', {})
+            .get('home', {})
+            .get('description', {})
+            .get('units', 1)
+        )
+        vacancy_rate = user_inputs.get('vacancyRate', 5)
+        advertising_cost = user_inputs.get('advertisingCostPerVacancy', 500)
+    
+        return units * 12 * (vacancy_rate / 100) / 2 * advertising_cost
+    except Exception as e:
+        logger.error(f"Error in calculate_advertizing_cost: {e}")
+        return 0
+
+def calculate_repairs_cost(total_income: float, user_inputs: Dict) -> float:
+    repairs_rate = user_inputs.get('repairsRate', 5)
+    return (repairs_rate / 100) * total_income
+
+def calculate_pest_control(property_detail: Dict) -> float:
+    units = property_detail.get('data', {}).get('home', {}).get('description', {}).get('units', 1)
+    return 140 * units if units < 2 else 70 * units
+
+def calculate_security_cost(property_detail: Dict, user_inputs: Dict) -> float:
+    units = property_detail.get('data', {}).get('home', {}).get('description', {}).get('units', 1)
+    vacancy_rate = user_inputs.get('vacancyRate', 5)
+    return units * 12 * (vacancy_rate/100) / 1.5 * 50
+
+def calculate_evictions_cost(property_detail: Dict, user_inputs: Dict) -> float:
+    units = property_detail.get('data', {}).get('home', {}).get('description', {}).get('units', 1)
+    vacancy_rate = user_inputs.get('vacancyRate', 5)
+    return units * 12 * (vacancy_rate/100) / 2 / 10 * 1000
+
+def calculate_total_expenses(property_detail: Dict, total_income: float, user_inputs: Dict) -> float:
+    try:
+        # Get property tax from API data safely
+        property_tax = (
+            property_detail.get('data', {})
+            .get('home', {})
+            .get('tax_history', [{}])[0]
+            .get('tax', 0)
+        )
+    
+        # Calculate variable costs
+        management_cost = calculate_management_cost(total_income, user_inputs)
+        advertising_cost = calculate_advertizing_cost(property_detail, user_inputs)
+        repairs_cost = calculate_repairs_cost(total_income, user_inputs)
+        pest_control = calculate_pest_control(property_detail)
+        security_cost = calculate_security_cost(property_detail, user_inputs)
+        evictions_cost = calculate_evictions_cost(property_detail, user_inputs)
+    
+        # Get HOA fee safely
+        hoa_fee = (
+            property_detail.get('data', {})
+            .get('home', {})
+            .get('hoa', {})
+            .get('fee', 0)
+        )
+    
+        # Sum all expenses
+        total = (
+            property_tax +
+            insurance +
+            repairs_cost +
+            utilities +  # electricity, gas, water/sewer를 utilities로 그룹화
+            maintenance_costs +  # lawn/snow, pest control 등을 maintenance로 그룹화
+            management_cost +
+            advertising_cost +
+            other_costs  # 나머지 비용들
+        )
+        
+        return total
+    except Exception as e:
+        logger.error(f"Error in calculate_total_expenses: {e}")
+        return 0
+
+def calculate_mortgage_payment(principle: float, interest_rate: float, amortization_years: int) -> float:
+    if interest_rate == 0 or principle == 0:
+        return 0
+        
+    rate = interest_rate / 100
+    monthly_rate = ((1 + (rate/2))**(1/6)) - 1
+    total_payments = amortization_years * 12
+    
+    payment = principle * (monthly_rate / (1 - (1 + monthly_rate)**(total_payments * -1)))
+    
+    return payment
+
+def calculate_debt_service(property_detail: Dict, user_inputs: Dict) -> float:
+    try:
+        # list_price를 안전하게 가져오기
+        list_price = property_detail.get('data', {}).get('home', {}).get('list_price', 0)
+        if not list_price:
+            return 0
+            
+    # Calculate first mortgage payment
+        first_mtg_principle = list_price * 0.8
+        first_mtg_rate = user_inputs.get('firstMtgInterestRate', 6.5)
+        first_mtg_payment = calculate_mortgage_payment(
+            first_mtg_principle, 
+            first_mtg_rate, 
+            user_inputs.get('mtgAmortizationPeriod', 30)
+        )
+    
+        # Calculate second mortgage payment
+        second_mtg_principle = user_inputs.get('secondMtgPrinciple', 0)
+        second_mtg_rate = user_inputs.get('secondMtgInterestRate', 0)
+        second_mtg_payment = calculate_mortgage_payment(
+            second_mtg_principle, 
+            second_mtg_rate, 
+            user_inputs.get('secondMtgAmortization', 30)
+        )
+    
+        # Calculate interest only payment
+        interest_only_principle = user_inputs.get('interestOnlyPrinciple', 0)
+        interest_only_rate = user_inputs.get('interestOnlyRate', 0)
+        interest_only_payment = (interest_only_principle * interest_only_rate / 100) / 12
+        
+        # Other financing costs
+        other_financing = user_inputs.get('otherMonthlyFinancing', 0)
+        
+        # Total monthly debt service
+        total_monthly = first_mtg_payment + second_mtg_payment + interest_only_payment + other_financing
+        
+        # Convert to annual
+        return total_monthly * 12
+    except Exception as e:
+        logger.error(f"Error in calculate_debt_service: {e}")
+        return 0
+
+def calculate_cash_on_cash_roi(property_detail: Dict, user_inputs: Dict) -> Union[str, float]:
+    try:
+        total_cash_required = calculate_total_cash_required(property_detail, user_inputs)
+        
+        if total_cash_required <= 0:
+            return "Infinite"
+            
+        # Calculate annual cashflow
+        total_income = calculate_total_income(property_detail, user_inputs)
+        vacancy_loss = calculate_vacancy_loss(total_income, user_inputs)
+        effective_gross_income = calculate_effective_gross_income(total_income, vacancy_loss)
+        total_expenses = calculate_total_expenses(property_detail, total_income, user_inputs)
+        net_operating_income = effective_gross_income - total_expenses
+        debt_service = calculate_debt_service(property_detail, user_inputs)
+        annual_cashflow = net_operating_income - debt_service
+        
+        # Calculate Cash on Cash ROI
+        cash_on_cash_roi = (annual_cashflow / abs(total_cash_required)) * 100
+        
+        return round(cash_on_cash_roi, 2)
+    except Exception as e:
+        logger.error(f"Error in calculate_cash_on_cash_roi: {e}")
+        return 0
+
+def calculate_total_roi(property_detail: Dict, user_inputs: Dict) -> Union[str, float]:
+    try:
+        # Get individual ROIs
+        cash_on_cash_roi = calculate_cash_on_cash_roi(property_detail, user_inputs)
+        equity_roi = calculate_equity_roi(property_detail, user_inputs)
+        appreciation_roi = calculate_appreciation_roi(property_detail, user_inputs)
+        forced_appreciation_roi = calculate_forced_appreciation_roi(property_detail, user_inputs)
+        
+        # If any ROI is "Infinite", return "Infinite"
+        if any(isinstance(roi, str) for roi in [cash_on_cash_roi, equity_roi, appreciation_roi, forced_appreciation_roi]):
+            return "Infinite"
+            
+        # Sum all ROIs
+        total_roi = cash_on_cash_roi + equity_roi + appreciation_roi + forced_appreciation_roi
+        
+        return round(total_roi, 2)
+    except Exception as e:
+        logger.error(f"Error in calculate_total_roi: {e}")
+        return 0
+
+def calculate_dcr(property_detail: Dict, user_inputs: Dict) -> Union[str, float]:
+    try:
+        # Calculate Net Operating Income
+        total_income = calculate_total_income(property_detail, user_inputs)
+        vacancy_loss = calculate_vacancy_loss(total_income, user_inputs)
+        effective_gross_income = calculate_effective_gross_income(total_income, vacancy_loss)
+        total_expenses = calculate_total_expenses(property_detail, total_income, user_inputs)
+        net_operating_income = effective_gross_income - total_expenses
+        
+        # Calculate Debt Servicing Costs (negative value)
+        debt_servicing_costs = calculate_debt_servicing_costs(property_detail, user_inputs)
+        
+        # Apply DCR formula
+        if -debt_servicing_costs <= 0:
+            return "No Debt to Cover"
+        elif debt_servicing_costs == 0:
+            return "Unknown"
+        else:
+            dcr = net_operating_income / -debt_servicing_costs
+            return round(dcr, 2)
+            
+    except Exception as e:
+        logger.error(f"Error in calculate_dcr: {e}")
+        return "Unknown"
+
+def calculate_expense_to_income_ratio(property_detail: Dict, user_inputs: Dict) -> float:
+    try:
+        total_income = calculate_total_income(property_detail, user_inputs)
+        if total_income == 0:
+            return 0
+            
+        total_expenses = calculate_total_expenses(property_detail, total_income, user_inputs)
+        
+        # Calculate ratio: Total Expenses / Total Income
+        ratio = (total_expenses / total_income) * 100
+        
+        return round(ratio, 2)
+    except Exception as e:
+        logger.error(f"Error in calculate_expense_to_income_ratio: {e}")
+        return 0
+
+def calculate_cashflow(property_detail: Dict, user_inputs: Dict) -> Dict:
+    try:
+        # 기존 계산
+        total_income = calculate_total_income(property_detail, user_inputs)
+        vacancy_loss = calculate_vacancy_loss(total_income, user_inputs)
+        effective_gross_income = calculate_effective_gross_income(total_income, vacancy_loss)
+        total_expenses = calculate_total_expenses(property_detail, total_income, user_inputs)
+        net_operating_income = effective_gross_income - total_expenses
+        debt_service = calculate_debt_service(property_detail, user_inputs)
+        annual_cashflow = net_operating_income - debt_service
+        monthly_cashflow = annual_cashflow / 12
+        units = property_detail.get('data', {}).get('home', {}).get('description', {}).get('units', 1) or 1
+        cashflow_per_unit = monthly_cashflow / units
+
+        # 추가 계산
+        real_purchase_price = calculate_real_purchase_price(property_detail, user_inputs)
+        cash_required_to_close = calculate_cash_required_to_close(property_detail, user_inputs)
+        total_cash_required = calculate_total_cash_required(property_detail, user_inputs)
+        equity_roi = calculate_equity_roi(property_detail, user_inputs)
+        appreciation_roi = calculate_appreciation_roi(property_detail, user_inputs)
+        forced_appreciation_roi = calculate_forced_appreciation_roi(property_detail, user_inputs)
+        expense_to_income_ratio = calculate_expense_to_income_ratio(property_detail, user_inputs)
+        
+        # Add Cash on Cash ROI calculation
+        cash_on_cash_roi = calculate_cash_on_cash_roi(property_detail, user_inputs)
+        
+        total_roi = calculate_total_roi(property_detail, user_inputs)
+        
+        # Add DCR calculation
+        dcr = calculate_dcr(property_detail, user_inputs)
+    
+        return {
+            "Effective Gross Income": effective_gross_income,
+            "Operating Expenses": total_expenses,
+            "Net Operating Income": net_operating_income,
+            "Debt Servicing Costs": debt_service,
+            "Annual Profit or Loss": annual_cashflow,
+            "Total Monthly Profit or Loss": monthly_cashflow,
+            "Cashflow per Unit per Month": cashflow_per_unit,
+            "Vacancy Loss": vacancy_loss,
+            "Units": units,
+            "Real Purchase Price": real_purchase_price,
+            "Cash Required to Close": cash_required_to_close,
+            "Total Cash Required": total_cash_required,
+            "Equity ROI": equity_roi,
+            "Appreciation ROI": appreciation_roi,
+            "Forced Appreciation ROI": forced_appreciation_roi,
+            "Expense to Income Ratio": expense_to_income_ratio,
+            "Cash on Cash ROI": cash_on_cash_roi,
+            "Total ROI": total_roi,
+            "DCR": dcr,
+            "First Mortgage LTV": calculate_mortgage_ltv(property_detail, calculate_first_mtg_principle_borrowed(property_detail)),
+            "First Mortgage LTPP": calculate_mortgage_ltpp(property_detail, calculate_first_mtg_principle_borrowed(property_detail)),
+            "Second Mortgage LTV": calculate_mortgage_ltv(property_detail, user_inputs.get('secondMtgPrinciple', 0)),
+            "Second Mortgage LTPP": calculate_mortgage_ltpp(property_detail, user_inputs.get('secondMtgPrinciple', 0)),
+            "Cap Rate on PP": calculate_cap_rate(property_detail, net_operating_income, False),
+            "Cap Rate on FMV": calculate_cap_rate(property_detail, net_operating_income, True),
+            "Average Rent": calculate_average_rent(total_income, units),
+            "GRM": calculate_grm(property_detail, total_income),
+            "First Mtg Total Principle": calculate_first_mtg_total_principle(property_detail, user_inputs),
+            "First Mtg Monthly Payment": calculate_first_mtg_monthly_payment(property_detail, user_inputs),
+            "Second Mtg Monthly Payment": calculate_second_mtg_monthly_payment(user_inputs),
+            "Interest Only Monthly Payment": calculate_interest_only_monthly_payment(user_inputs),
+            "Monthly Income": total_income / 12,
+            "Monthly Expenses": total_expenses / 12,
+            "Monthly Net Operating Income": net_operating_income / 12,
+            "Monthly Debt Servicing Costs": calculate_debt_servicing_costs(property_detail, user_inputs) / 12,
+            "Monthly Operating Income": total_income / 12,
+            "Monthly Operating Expenses": total_expenses / 12,
+            "Monthly Net Operating Income": net_operating_income / 12,
+            "Monthly Debt Servicing": debt_service / 12,
+        }
+    except Exception as e:
+        logger.error(f"Error in calculate_cashflow: {e}")
+        return {
+            "Effective Gross Income": 0,
+            "Operating Expenses": 0,
+            "Net Operating Income": 0,
+            "Debt Servicing Costs": 0,
+            "Annual Profit or Loss": 0,
+            "Total Monthly Profit or Loss": 0,
+            "Cashflow per Unit per Month": 0,
+            "Vacancy Loss": 0,
+            "Units": 1,
+            "Real Purchase Price": 0,
+            "Cash Required to Close": 0,
+            "Total Cash Required": 0,
+            "Equity ROI": 0,
+            "Appreciation ROI": 0,
+            "Forced Appreciation ROI": 0,
+            "Expense to Income Ratio": 0,
+            "Cash on Cash ROI": 0,
+            "Total ROI": 0,
+            "DCR": "Unknown",
+            "First Mortgage LTV": 0,
+            "First Mortgage LTPP": 0,
+            "Second Mortgage LTV": 0,
+            "Second Mortgage LTPP": 0,
+            "Cap Rate on PP": 0,
+            "Cap Rate on FMV": 0,
+            "Average Rent": 0,
+            "GRM": 0,
+            "First Mtg Total Principle": 0,
+            "First Mtg Monthly Payment": 0,
+            "Second Mtg Monthly Payment": 0,
+            "Interest Only Monthly Payment": 0,
+            "Monthly Income": 0,
+            "Monthly Expenses": 0,
+            "Monthly Net Operating Income": 0,
+            "Monthly Debt Servicing Costs": 0,
+            "Monthly Operating Income": 0,
+            "Monthly Operating Expenses": 0,
+            "Monthly Net Operating Income": 0,
+            "Monthly Debt Servicing": 0,
+        }
+
+def calculate_real_purchase_price(property_detail: Dict, user_inputs: Dict) -> float:
+    offer_price = property_detail.get('data', {}).get('home', {}).get('list_price', 0)
+    transfer_tax = property_detail.get('data', {}).get('home', {}).get('tax_history', [{}])[0].get('tax', 0)
+    
+    total = (offer_price + 
+            transfer_tax +
+            user_inputs.get('repairs', 0) +
+            user_inputs.get('repairsContingency', 0) +
+            user_inputs.get('lenderFee', 0) +
+            user_inputs.get('brokerFee', 0) +
+            user_inputs.get('environmentals', 0) +
+            user_inputs.get('inspections', 0) +
+            user_inputs.get('appraisals', 0) +
+            user_inputs.get('misc', 0) +
+            user_inputs.get('legal', 0))
+    
+    return total
+
+def calculate_first_mtg_principle_borrowed(property_detail: Dict) -> float:
+    offer_price = property_detail.get('data', {}).get('home', {}).get('list_price', 0)
+    return offer_price * 0.8
+
+def calculate_first_mtg_total_principle(property_detail: Dict, user_inputs: Dict) -> float:
+    first_mtg_principle_borrowed = calculate_first_mtg_principle_borrowed(property_detail)
+    cmhc_fee_rate = user_inputs.get('firstMtgCMHCFee', 0)
+    
+    return first_mtg_principle_borrowed * (1 + (cmhc_fee_rate / 100))
+
+def calculate_first_mtg_monthly_payment(property_detail: Dict, user_inputs: Dict) -> float:
+    total_principle = calculate_first_mtg_total_principle(property_detail, user_inputs)
+    interest_rate = user_inputs.get('firstMtgInterestRate', 0)
+    amortization_period = user_inputs.get('firstMtgAmortizationPeriod', 30)
+    
+    return calculate_mortgage_payment(total_principle, interest_rate, amortization_period)
+
+def calculate_second_mtg_monthly_payment(user_inputs: Dict) -> float:
+    principle = user_inputs.get('secondMtgPrinciple', 0)
+    interest_rate = user_inputs.get('secondMtgInterestRate', 0)
+    amortization_period = user_inputs.get('secondMtgAmortization', 30)
+    
+    return calculate_mortgage_payment(principle, interest_rate, amortization_period)
+
+def calculate_interest_only_monthly_payment(user_inputs: Dict) -> float:
+    principle = user_inputs.get('interestOnlyPrinciple', 0)
+    interest_rate = user_inputs.get('interestOnlyRate', 0)
+    
+    if interest_rate == 0 or principle == 0:
+        return 0
+    
+    return (principle * (interest_rate / 100)) / 12
+
+def calculate_cash_required_to_close(property_detail: Dict, user_inputs: Dict) -> float:
+    rpp = calculate_real_purchase_price(property_detail, user_inputs)
+    first_mtg_principle_borrowed = calculate_first_mtg_principle_borrowed(property_detail)
+    second_mtg_principle = user_inputs.get('secondMtgPrinciple', 0)
+    interest_only_principle = user_inputs.get('interestOnlyPrinciple', 0)
+    
+    return rpp - first_mtg_principle_borrowed - second_mtg_principle - interest_only_principle
+
+def calculate_cash_required_to_close_after_deposits(property_detail: Dict, user_inputs: Dict) -> float:
+    cash_required_to_close = calculate_cash_required_to_close(property_detail, user_inputs)
+    deposits_with_offer = user_inputs.get('depositsWithOffer', 0)
+    
+    return cash_required_to_close - deposits_with_offer
+
+def calculate_total_cash_required(property_detail: Dict, user_inputs: Dict) -> float:
+    cash_required_to_close = calculate_cash_required_to_close_after_deposits(property_detail, user_inputs)
+    deposits_with_offer = user_inputs.get('depositsWithOffer', 0)
+    pro_ration_of_rents = user_inputs.get('proRationOfRents', 0)
+    
+    return cash_required_to_close + deposits_with_offer - pro_ration_of_rents
+
+def calculate_debt_servicing_costs(property_detail: Dict, user_inputs: Dict) -> float:
+    first_mtg_payment = calculate_first_mtg_monthly_payment(property_detail, user_inputs)
+    second_mtg_payment = calculate_second_mtg_monthly_payment(user_inputs)
+    interest_only_payment = calculate_interest_only_monthly_payment(user_inputs)
+    other_financing = user_inputs.get('otherMonthlyFinancing', 0)
+    
+    return -(first_mtg_payment + second_mtg_payment + interest_only_payment + other_financing) * 12
+
+def calculate_first_mtg_amortization_ending_balance(property_detail: Dict, user_inputs: Dict) -> float:
+    total_principle = calculate_first_mtg_total_principle(property_detail, user_inputs)
+    interest_rate = user_inputs.get('firstMtgInterestRate', 0)
+    monthly_payment = calculate_first_mtg_monthly_payment(property_detail, user_inputs)
+    
+    if interest_rate == 0 or total_principle == 0:
+        return total_principle
+    
+    rate = interest_rate / 100
+    monthly_rate = ((1 + (rate/2))**(1/6)) - 1
+    balance = total_principle
+    
+    for _ in range(12):
+        interest_payment = balance * monthly_rate
+        principal_payment = monthly_payment - interest_payment
+        balance -= principal_payment
+    
+    return balance
+
+def calculate_second_mtg_amortization_ending_balance(user_inputs: Dict) -> float:
+    principle = user_inputs.get('secondMtgPrinciple', 0)
+    interest_rate = user_inputs.get('secondMtgInterestRate', 0)
+    monthly_payment = calculate_second_mtg_monthly_payment(user_inputs)
+    
+    if interest_rate == 0 or principle == 0:
+        return principle
+    
+    rate = interest_rate / 100
+    monthly_rate = ((1 + (rate/2))**(1/6)) - 1
+    balance = principle
+    
+    for _ in range(12):
+        interest_payment = balance * monthly_rate
+        principal_payment = monthly_payment - interest_payment
+        balance -= principal_payment
+    
+    return balance
+
+def calculate_equity_roi(property_detail: Dict, user_inputs: Dict) -> Union[str, float]:
+    total_cash_required = calculate_total_cash_required(property_detail, user_inputs)
+    
+    if total_cash_required <= 0:
+        return "Infinite"
+    
+    first_mtg_principle_borrowed = calculate_first_mtg_principle_borrowed(property_detail)
+    first_mtg_ending_balance = calculate_first_mtg_amortization_ending_balance(property_detail, user_inputs)
+    second_mtg_principle = user_inputs.get('secondMtgPrinciple', 0)
+    second_mtg_ending_balance = calculate_second_mtg_amortization_ending_balance(user_inputs)
+    
+    equity_roi = ((first_mtg_principle_borrowed - first_mtg_ending_balance + 
+                  second_mtg_principle - second_mtg_ending_balance) / 
+                 total_cash_required) * 100
+    
+    return round(equity_roi, 2)
+
+def calculate_appreciation_roi(property_detail: Dict, user_inputs: Dict) -> Union[str, float]:
+    total_cash_required = calculate_total_cash_required(property_detail, user_inputs)
+    
+    if total_cash_required <= 0:
+        return "Infinite"
+    
+    fair_market_value = property_detail.get('data', {}).get('home', {}).get('list_price', 0)
+    annual_appreciation_rate = user_inputs.get('annualAppreciationRate', 0) / 100
+    
+    appreciation_roi = ((fair_market_value * (1 + annual_appreciation_rate) - fair_market_value) / 
+                       abs(total_cash_required)) * 100
+    
+    return round(appreciation_roi, 2)
+
+def calculate_forced_appreciation_roi(property_detail: Dict, user_inputs: Dict) -> Union[str, float]:
+    total_cash_required = calculate_total_cash_required(property_detail, user_inputs)
+    
+    if total_cash_required <= 0:
+        return "Infinite"
+    
+    fair_market_value = property_detail.get('data', {}).get('home', {}).get('list_price', 0)
+    rpp = calculate_real_purchase_price(property_detail, user_inputs)
+    
+    forced_appreciation_roi = ((fair_market_value - rpp) / abs(total_cash_required)) * 100
+    
+    return round(forced_appreciation_roi, 2)
+
+def calculate_mortgage_ltv(property_detail: Dict, mtg_principle: float) -> float:
+    fair_market_value = property_detail.get('data', {}).get('home', {}).get('list_price', 0)
+    return mtg_principle / fair_market_value if fair_market_value else 0
+
+def calculate_mortgage_ltpp(property_detail: Dict, mtg_principle: float) -> float:
+    offer_price = property_detail.get('data', {}).get('home', {}).get('list_price', 0)
+    return mtg_principle / offer_price if offer_price else 0
+
+def calculate_cap_rate(property_detail: Dict, net_operating_income: float, on_fmv: bool = True) -> float:
+    value = property_detail.get('data', {}).get('home', {}).get('list_price', 0)
+    return (net_operating_income / value) * 100 if value else 0
+
+def calculate_average_rent(gross_rents: float, units: int) -> float:
+    return gross_rents / units / 12 if units else 0
+
+def calculate_grm(property_detail: Dict, gross_rents: float) -> float:
+    offer_price = property_detail.get('data', {}).get('home', {}).get('list_price', 0)
+    return offer_price / gross_rents if gross_rents else 0
